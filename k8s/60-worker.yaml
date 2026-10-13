@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: jubair2002/assesment-backend:task2
+          command: ["node", "src/worker.js"]
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: SEARCH_URL
+              value: http://search:9200
+            - name: DB_WRITE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_WRITE_URL
+            - name: DB_READ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_READ_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
