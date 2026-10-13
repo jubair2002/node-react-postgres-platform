@@ -5,7 +5,7 @@ A simple React + Node.js + PostgreSQL app turned into a production-style platfor
 | Item | Detail |
 |---|---|
 | Repository | `jubair2002/node-react-postgres-platform` |
-| Platform | AWS EC2 (Ubuntu) |
+| Platform | AWS EC2 (Ubuntu) m7i.XLarge (as local environment)|
 | Cluster | kind (`my-cluster`), single control-plane node |
 | Namespace | `dev` (app), `monitoring` (Prometheus/Grafana), Fluent Bit and Loki |
 | Registry | Docker Hub (`jubair2002/assesment-backend`, `jubair2002/assesment-frontend`) |
