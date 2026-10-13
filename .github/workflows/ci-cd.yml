@@ -1,4 +1,3 @@
-
 name: CI/CD
 
 on:
@@ -21,21 +20,14 @@ on:
 permissions:
   contents: read
 
-env:
-  IMAGE_BACKEND: ${{ secrets.DOCKERHUB_USERNAME }}/assesment-backend
-  IMAGE_FRONTEND: ${{ secrets.DOCKERHUB_USERNAME }}/assesment-frontend
-
 jobs:
   build-and-test:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
@@ -47,13 +39,13 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      - name: Validate backend
+      - name: Validate backend syntax
         working-directory: backend
-        run: node --check src/index.js
+        run: node --check src/index.js && node --check src/worker.js
 
       - name: Run backend tests
         working-directory: backend
-        run: npm test --if-present
+        run: npm test
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -67,41 +59,30 @@ jobs:
     if: github.event_name == 'push'
     needs: build-and-test
     runs-on: ubuntu-latest
-
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       namespace: ${{ steps.meta.outputs.namespace }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Determine image tag and environment
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-
           SHORT_SHA="${GITHUB_SHA:0:7}"
           SAFE_BRANCH="${GITHUB_REF_NAME//\//-}"
-
           echo "tag=${SAFE_BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
           case "$GITHUB_REF_NAME" in
-            main)
-              echo "namespace=dev" >> "$GITHUB_OUTPUT"
-              ;;
-            pre-release/v*)
-              echo "namespace=preprod" >> "$GITHUB_OUTPUT"
-              ;;
-            release/v*)
-              echo "namespace=release" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Unsupported deployment branch"
-              exit 1
-              ;;
+            main) echo "namespace=dev" >> "$GITHUB_OUTPUT" ;;
+            pre-release/v*) echo "namespace=preprod" >> "$GITHUB_OUTPUT" ;;
+            release/v*) echo "namespace=release" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unsupported deployment branch"; exit 1 ;;
           esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -116,8 +97,8 @@ jobs:
           file: Dockerfile.backend
           push: true
           tags: |
-            ${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.namespace }}-latest
+            jubair2002/assesment-backend:${{ steps.meta.outputs.tag }}
+            jubair2002/assesment-backend:${{ steps.meta.outputs.namespace }}-latest
 
       - name: Build and push frontend
         uses: docker/build-push-action@v6
@@ -125,35 +106,48 @@ jobs:
           context: .
           file: Dockerfile.frontend
           push: true
+          build-args: |
+            VITE_API_BASE_URL=/api
           tags: |
-            ${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.namespace }}-latest
+            jubair2002/assesment-frontend:${{ steps.meta.outputs.tag }}
+            jubair2002/assesment-frontend:${{ steps.meta.outputs.namespace }}-latest
 
   deploy:
     if: github.event_name == 'push'
     needs: build-and-push
-
-    # Install a self-hosted runner on the EC2 instance running kind.
     runs-on: [self-hosted, linux, x64]
-
     environment: ${{ needs.build-and-push.outputs.namespace }}
-
+    env:
+      NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
+      TAG: ${{ needs.build-and-push.outputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Create deployment secrets
+      - name: Validate deployment secrets
         env:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${{ secrets.OPENSEARCH_INITIAL_ADMIN_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DB_PASSWORD" || { echo "DB_PASSWORD is missing"; exit 1; }
+          test -n "$OPENSEARCH_INITIAL_ADMIN_PASSWORD" || { echo "OPENSEARCH_INITIAL_ADMIN_PASSWORD is missing"; exit 1; }
+          test -n "$DOCKERHUB_USERNAME" || { echo "DOCKERHUB_USERNAME is missing"; exit 1; }
+
+      - name: Create namespace and application secrets
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${{ secrets.OPENSEARCH_INITIAL_ADMIN_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
 
-          test -n "$DB_PASSWORD"
+          # URL-encode the database password so special characters are safe in URLs.
+          ENCODED_PASSWORD="$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["DB_PASSWORD"], safe=""))')"
 
-          DB_WRITE_URL="postgres://appuser:${DB_PASSWORD}@postgres:5432/appdb"
-          DB_READ_URL="postgres://appuser:${DB_PASSWORD}@postgres:5432/appdb"
+          DB_WRITE_URL="postgres://appuser:${ENCODED_PASSWORD}@postgres:5432/appdb"
+          DB_READ_URL="postgres://appuser:${ENCODED_PASSWORD}@postgres:5432/appdb"
 
           kubectl create namespace "$NAMESPACE" \
             --dry-run=client -o yaml | kubectl apply -f -
@@ -163,52 +157,66 @@ jobs:
             --from-literal=DB_PASSWORD="$DB_PASSWORD" \
             --from-literal=DB_WRITE_URL="$DB_WRITE_URL" \
             --from-literal=DB_READ_URL="$DB_READ_URL" \
+            --from-literal=OPENSEARCH_INITIAL_ADMIN_PASSWORD="$OPENSEARCH_INITIAL_ADMIN_PASSWORD" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Apply Kubernetes manifests
-        env:
-          NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
-          TAG: ${{ needs.build-and-push.outputs.tag }}
+      - name: Apply all application manifests
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p /tmp/assessment-manifests
+          MANIFEST_DIR="$(mktemp -d)"
+          trap 'rm -rf "$MANIFEST_DIR"' EXIT
+
           cp k8s/10-postgres.yaml \
              k8s/20-backend.yaml \
              k8s/30-frontend.yaml \
              k8s/40-ingress.yaml \
-             /tmp/assessment-manifests/
+             k8s/50-redis-search.yaml \
+             k8s/60-worker.yaml \
+             "$MANIFEST_DIR/"
 
-          sed -i "s/namespace: dev/namespace: ${NAMESPACE}/g" \
-            /tmp/assessment-manifests/*.yaml
+          # Adapt manifests to the environment selected by the branch.
+          sed -i "s/namespace: dev/namespace: ${NAMESPACE}/g" "$MANIFEST_DIR"/*.yaml
 
-          sed -i \
-            "s#image: jubair2002/assesment-backend:.*#image: jubair2002/assesment-backend:${TAG}#" \
-            /tmp/assessment-manifests/20-backend.yaml
+          # Use the same immutable commit tag for all application images.
+          sed -i "s#image: jubair2002/assesment-backend:.*#image: jubair2002/assesment-backend:${TAG}#" \
+            "$MANIFEST_DIR/20-backend.yaml" \
+            "$MANIFEST_DIR/60-worker.yaml"
 
-          sed -i \
-            "s#image: jubair2002/assesment-frontend:.*#image: jubair2002/assesment-frontend:${TAG}#" \
-            /tmp/assessment-manifests/30-frontend.yaml
+          sed -i "s#image: jubair2002/assesment-frontend:.*#image: jubair2002/assesment-frontend:${TAG}#" \
+            "$MANIFEST_DIR/30-frontend.yaml"
 
-          kubectl apply -f /tmp/assessment-manifests/
+          kubectl apply -f "$MANIFEST_DIR/"
 
-          kubectl rollout status deployment/postgres \
-            -n "$NAMESPACE" --timeout=180s
-          kubectl rollout status deployment/backend \
-            -n "$NAMESPACE" --timeout=180s
-          kubectl rollout status deployment/frontend \
-            -n "$NAMESPACE" --timeout=180s
+      - name: Wait for infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/postgres -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/redis -n "$NAMESPACE" --timeout=180s
+          kubectl rollout status deployment/search -n "$NAMESPACE" --timeout=300s
+
+      - name: Wait for application deployments
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/worker -n "$NAMESPACE" --timeout=180s
 
       - name: Verify deployment
-        env:
-          NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
-        run: kubectl get pods,services,ingress -n "$NAMESPACE"
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get deployments,pods,services,ingress -n "$NAMESPACE"
+          kubectl wait --for=condition=Ready pods \
+            -l 'app in (postgres,redis,search,backend,frontend,worker)' \
+            -n "$NAMESPACE" --timeout=60s
 
   rollback:
     if: github.event_name == 'workflow_dispatch' && inputs.rollback_namespace != ''
     runs-on: [self-hosted, linux, x64]
-
     steps:
       - name: Roll back backend and frontend
         env:
@@ -218,5 +226,5 @@ jobs:
           set -euo pipefail
           kubectl rollout undo deployment/backend -n "$NAMESPACE"
           kubectl rollout undo deployment/frontend -n "$NAMESPACE"
-          kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=180s
-          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=180s
+          kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=300s
